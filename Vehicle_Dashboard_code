@@ -1,0 +1,555 @@
+#!/usr/bin/env python3 
+""" 
+Vehicle Dashboard — 3-node system (2 vehicles + 1 blind node) 
+--------------------------------------------------------------- 
+Reads the "DATA,..." telemetry lines printed by vehicle_node.ino over USB 
+serial and renders: 
+ 
+    +------------------+   +---------------------------+ 
+    | MY TRUCK         |   | OTHER VEHICLE DETECTED (red)| 
+    | ID               |   | ID                          | 
+    | Acceleration     |   | Acceleration                | 
+    | Direction        |   | Direction to this truck     | 
+    | Object detection |   | Approaching at Distance     | 
+    +------------------+   +---------------------------+ 
+ 
+    +----------------------------------------------------+ 
+    | BLIND NODE DETECTED (amber)                         | 
+    | Blind node <ID> is approaching at X m                | 
+    +----------------------------------------------------+ 
+ 
+    [ optional banner, only while active ] 
+    *** Vehicle <ID> is approaching from the other side of 
+        the blind node (~X m from the blind node) *** 
+ 
+    +-------------------------------------------+ 
+    |   Truck tilt (Danger Tilt / Normal)        | 
+    |   + Direction arrow                        | 
+    +-------------------------------------------+ 
+ 
+Requires: pyserial   ->   pip install pyserial 
+Run:      python vehicle_dashboard.py 
+""" 
+ 
+import math 
+import queue 
+import threading 
+import time 
+import tkinter as tk 
+from tkinter import ttk, messagebox 
+ 
+try: 
+    import serial 
+    import serial.tools.list_ports 
+except ImportError: 
+    serial = None 
+ 
+# ---------------- Configuration ---------------- 
+BAUD_RATE = 115200 
+OBJECT_DETECT_THRESHOLD_M = 1.0 
+STALE_AFTER_SEC = 2.5 
+RELAY_ALERT_TTL_SEC = 2.0     # how long a relay alert banner stays visible after last refresh 
+ 
+RISK_COLORS = { 
+    "SAFE": "#2ecc71", 
+    "CAUTION": "#f1c40f", 
+    "WARNING": "#e67e22", 
+    "CRITICAL": "#e74c3c", 
+} 
+ 
+BG = "#1e2228" 
+PANEL_BG = "#262b33" 
+FG = "#e8e8e8" 
+MUTED = "#8a8f98" 
+ACCENT_RED = "#e74c3c" 
+ACCENT_GREEN = "#2ecc71" 
+ACCENT_AMBER = "#f1c40f" 
+ 
+ 
+# ---------------- Data holders ---------------- 
+class VehicleData: 
+    def __init__(self): 
+        self.vehicle_id = "--" 
+        self.counter = 0 
+        self.net_accel = 0.0 
+        self.direction = "STRAIGHT" 
+        self.danger_tilt = False 
+        self.roll_deg = 0.0 
+        self.pitch_deg = 0.0 
+        self.distance_cm = 0.0 
+        self.closing_speed = 0.0 
+        self.ttc = -1.0 
+        self.object_detected = False 
+        self.risk = "SAFE" 
+        self.rssi = 0 
+        self.rssi_dist_m = 0.0 
+        self.last_update = 0.0 
+ 
+    def is_stale(self): 
+        return (time.time() - self.last_update) > STALE_AFTER_SEC or self.last_update == 0.0 
+ 
+ 
+class BlindNodeSighting: 
+    def __init__(self): 
+        self.blind_id = "--" 
+        self.dist_m = 0.0 
+        self.rssi = 0 
+        self.last_update = 0.0 
+ 
+    def is_stale(self): 
+        return (time.time() - self.last_update) > STALE_AFTER_SEC or self.last_update == 0.0 
+ 
+ 
+class RelayAlert: 
+    def __init__(self): 
+        self.other_vehicle_id = "--" 
+        self.other_dist_m = 0.0 
+        self.last_update = 0.0 
+ 
+    def is_active(self): 
+        return self.last_update > 0.0 and (time.time() - self.last_update) <= RELAY_ALERT_TTL_SEC 
+ 
+ 
+# ---------------- Serial reader thread ---------------- 
+class SerialReader(threading.Thread): 
+    def __init__(self, port, baud, out_queue): 
+        super().__init__(daemon=True) 
+        self.port = port 
+        self.baud = baud 
+        self.queue = out_queue 
+        self._stop_event = threading.Event() 
+        self.ser = None 
+ 
+    def run(self): 
+        try: 
+            self.ser = serial.Serial(self.port, self.baud, timeout=1) 
+        except Exception as exc: 
+            self.queue.put(("ERROR", f"Could not open {self.port}: {exc}")) 
+            return 
+ 
+        self.queue.put(("STATUS", f"Connected to {self.port} @ {self.baud} baud")) 
+        while not self._stop_event.is_set(): 
+            try: 
+                raw = self.ser.readline() 
+            except Exception as exc: 
+                self.queue.put(("ERROR", f"Serial read failed: {exc}")) 
+                break 
+            if not raw: 
+                continue 
+            line = raw.decode(errors="ignore").strip() 
+            if not line or not line.startswith("DATA,"): 
+                continue 
+            parsed = self._parse_data_line(line) 
+            if parsed: 
+                self.queue.put(parsed) 
+ 
+        if self.ser and self.ser.is_open: 
+            self.ser.close() 
+ 
+    @staticmethod 
+    def _parse_data_line(line): 
+        parts = line.split(",") 
+        if len(parts) < 2: 
+            return None 
+        role = parts[1] 
+ 
+        try: 
+            if role in ("LOCAL", "REMOTE_VEHICLE"): 
+                # DATA,ROLE,id,counter,netAccel,direction,dangerTilt,rollDeg,pitchDeg, 
+                #      distanceCm,closingSpeedCmS,ttcSec,objectDetected,risk,rssi,rssiDistM 
+                if len(parts) != 16: 
+                    return None 
+                d = VehicleData() 
+                d.vehicle_id = parts[2] 
+                d.counter = int(parts[3]) 
+                d.net_accel = float(parts[4]) 
+                d.direction = parts[5] 
+                d.danger_tilt = parts[6] == "1" 
+                d.roll_deg = float(parts[7]) 
+                d.pitch_deg = float(parts[8]) 
+                d.distance_cm = float(parts[9]) 
+                d.closing_speed = float(parts[10]) 
+                d.ttc = float(parts[11]) 
+                d.object_detected = parts[12] == "1" 
+                d.risk = parts[13] 
+                d.rssi = int(parts[14]) 
+                d.rssi_dist_m = float(parts[15]) 
+                d.last_update = time.time() 
+                return ("VEHICLE", role, d) 
+ 
+            elif role == "BLIND": 
+                # DATA,BLIND,id,rssiDistM,rssi 
+                if len(parts) != 5: 
+                    return None 
+                b = BlindNodeSighting() 
+                b.blind_id = parts[2] 
+                b.dist_m = float(parts[3]) 
+                b.rssi = int(parts[4]) 
+                b.last_update = time.time() 
+                return ("BLIND", None, b) 
+ 
+            elif role == "RELAY": 
+                # DATA,RELAY,otherVehicleId,otherVehicleDistM 
+                if len(parts) != 4: 
+                    return None 
+                r = RelayAlert() 
+                r.other_vehicle_id = parts[2] 
+                r.other_dist_m = float(parts[3]) 
+                r.last_update = time.time() 
+                return ("RELAY", None, r) 
+ 
+        except (ValueError, IndexError): 
+            return None 
+        return None 
+ 
+    def stop(self): 
+        self._stop_event.set() 
+ 
+ 
+# ---------------- Truck tilt + direction diagram ---------------- 
+class TruckDiagram(tk.Canvas): 
+    def __init__(self, master, **kwargs): 
+        super().__init__(master, bg=PANEL_BG, highlightthickness=0, **kwargs) 
+        self.roll_deg = 0.0 
+        self.danger = False 
+        self.direction = "STRAIGHT" 
+        self.bind("<Configure>", lambda e: self.redraw()) 
+        self.redraw() 
+ 
+    def update_diagram(self, roll_deg, danger, direction): 
+        self.roll_deg = roll_deg 
+        self.danger = danger 
+        self.direction = direction 
+        self.redraw() 
+ 
+    @staticmethod 
+    def _rotate(px, py, cx, cy, angle_deg): 
+        angle = math.radians(angle_deg) 
+        dx, dy = px - cx, py - cy 
+        rx = dx * math.cos(angle) - dy * math.sin(angle) 
+        ry = dx * math.sin(angle) + dy * math.cos(angle) 
+        return cx + rx, cy + ry 
+ 
+    def redraw(self): 
+        self.delete("all") 
+        w = max(self.winfo_width(), 400) 
+        h = max(self.winfo_height(), 220) 
+ 
+        cx, base_y = w * 0.25, h * 0.80 
+        half_w, height = 34, 78 
+        local_corners = [(-half_w, 0), (half_w, 0), (half_w, -height), (-half_w, -height)] 
+        rotated = [self._rotate(cx + lx, base_y + ly, cx, base_y, self.roll_deg) 
+                   for lx, ly in local_corners] 
+        flat = [c for pt in rotated for c in pt] 
+ 
+        color = ACCENT_RED if self.danger else ACCENT_GREEN 
+        self.create_line(cx - 90, base_y, cx + 90, base_y, fill=MUTED, width=2) 
+        self.create_polygon(flat, outline=color, width=3, fill="#3a4150") 
+        self.create_oval(rotated[3][0] - 4, rotated[3][1] - 4, 
+                          rotated[3][0] + 4, rotated[3][1] + 4, fill=color, outline="") 
+ 
+        status_text = "DANGER TILT" if self.danger else "NORMAL" 
+        self.create_text(cx, h * 0.94, text=status_text, fill=color, font=("Segoe UI", 13, "bold")) 
+        self.create_text(cx, h * 0.10, text=f"Roll: {self.roll_deg:+.1f}°", fill=MUTED, font=("Segoe UI", 9)) 
+ 
+        self.create_line(w * 0.5, h * 0.08, w * 0.5, h * 0.90, fill="#3a4150", width=1) 
+ 
+        dcx, dcy = w * 0.75, h * 0.46 
+        r = 46 
+        self.create_oval(dcx - r, dcy - r, dcx + r, dcy + r, outline="#3a4150", width=2) 
+ 
+        arrow_len = r - 8 
+        d = self.direction.upper() 
+        if d == "STRAIGHT": 
+            x1, y1, x2, y2 = dcx, dcy + arrow_len, dcx, dcy - arrow_len 
+        elif d == "BACK": 
+            x1, y1, x2, y2 = dcx, dcy - arrow_len, dcx, dcy + arrow_len 
+        elif d == "LEFT": 
+            x1, y1, x2, y2 = dcx + arrow_len, dcy, dcx - arrow_len, dcy 
+        elif d == "RIGHT": 
+            x1, y1, x2, y2 = dcx - arrow_len, dcy, dcx + arrow_len, dcy 
+        else: 
+            x1, y1, x2, y2 = dcx, dcy, dcx, dcy 
+ 
+        self.create_line(x1, y1, x2, y2, fill="#5dade2", width=5, arrow=tk.LAST, arrowshape=(16, 20, 8)) 
+        self.create_text(dcx, dcy + r + 18, text=d, fill=FG, font=("Segoe UI", 13, "bold")) 
+        self.create_text(dcx, h * 0.10, text="Direction", fill=MUTED, font=("Segoe UI", 9)) 
+ 
+ 
+# ---------------- Main application ---------------- 
+class DashboardApp: 
+    def __init__(self, root): 
+        self.root = root 
+        root.title("Vehicle Dashboard") 
+        root.geometry("960x880") 
+        root.configure(bg=BG) 
+        root.minsize(780, 700) 
+ 
+        self.data_queue = queue.Queue() 
+        self.reader = None 
+        self.local = VehicleData() 
+        self.remote = VehicleData() 
+        self.blind = BlindNodeSighting() 
+        self.relay = RelayAlert() 
+ 
+        self._build_style() 
+        self._build_ui() 
+        self._refresh_ports() 
+ 
+        self.root.after(150, self._poll_queue) 
+        self.root.after(300, self._tick_refresh) 
+ 
+    # ---------- styling ---------- 
+    def _build_style(self): 
+        style = ttk.Style() 
+        try: 
+            style.theme_use("clam") 
+        except tk.TclError: 
+            pass 
+        style.configure("TFrame", background=BG) 
+        style.configure("TLabel", background=BG, foreground=FG, font=("Segoe UI", 10)) 
+        style.configure("Header.TLabel", background=BG, foreground=FG, font=("Segoe UI", 16, "bold")) 
+        style.configure("TButton", font=("Segoe UI", 10)) 
+ 
+    # ---------- layout ---------- 
+    def _build_ui(self): 
+        top = ttk.Frame(self.root, padding=(14, 10)) 
+        top.pack(fill="x") 
+        ttk.Label(top, text="Vehicle Dashboard", style="Header.TLabel").pack(side="left") 
+ 
+        conn = ttk.Frame(self.root, padding=(14, 0, 14, 10)) 
+        conn.pack(fill="x") 
+        ttk.Label(conn, text="Port:").pack(side="left") 
+        self.port_var = tk.StringVar() 
+        self.port_combo = ttk.Combobox(conn, textvariable=self.port_var, width=18, state="readonly") 
+        self.port_combo.pack(side="left", padx=(6, 6)) 
+        ttk.Button(conn, text="Refresh", command=self._refresh_ports).pack(side="left") 
+        self.connect_btn = ttk.Button(conn, text="Connect", command=self._toggle_connection) 
+        self.connect_btn.pack(side="left", padx=(10, 0)) 
+        self.status_var = tk.StringVar(value="Disconnected") 
+        ttk.Label(conn, textvariable=self.status_var, foreground=MUTED, background=BG).pack(side="left", padx=(14, 0)) 
+ 
+        panels = ttk.Frame(self.root, padding=(14, 4)) 
+        panels.pack(fill="x") 
+        panels.columnconfigure(0, weight=1) 
+        panels.columnconfigure(1, weight=1) 
+ 
+        self.my_panel, self.my_labels = self._build_info_panel( 
+            panels, "MY TRUCK", border_color="#3a4150", 
+            fields=["ID", "Acceleration", "Direction", "Object Detection"]) 
+        self.my_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8)) 
+ 
+        self.other_panel, self.other_labels = self._build_info_panel( 
+            panels, "OTHER VEHICLE DETECTED", border_color=ACCENT_RED, 
+            fields=["ID", "Acceleration", "Direction to this truck", "Approaching at Distance", "Risk"]) 
+        self.other_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0)) 
+ 
+        # Blind node panel (full width) 
+        blind_frame = ttk.Frame(self.root, padding=(14, 4)) 
+        blind_frame.pack(fill="x") 
+        self.blind_panel, self.blind_labels = self._build_info_panel( 
+            blind_frame, "BLIND NODE DETECTED", border_color=ACCENT_AMBER, 
+            fields=["ID", "Approaching at Distance"]) 
+        self.blind_panel.pack(fill="x") 
+ 
+        # Relay alert banner — the frame stays fixed in the layout; only the 
+        # label inside it is shown/hidden, so nothing jumps around. 
+        self.relay_frame = tk.Frame(self.root, bg=BG) 
+        self.relay_frame.pack(fill="x", padx=14, pady=(0, 0)) 
+        self.relay_label = tk.Label(self.relay_frame, text="", bg=ACCENT_RED, fg="#1e2228", 
+                                     font=("Segoe UI", 12, "bold"), pady=10) 
+        # self.relay_label is packed/unpacked dynamically in _render_relay_banner 
+ 
+        diagram_frame = ttk.Frame(self.root, padding=(14, 10)) 
+        diagram_frame.pack(fill="both", expand=True) 
+        ttk.Label(diagram_frame, text="Truck Tilt & Direction (My Truck)", style="Header.TLabel").pack(anchor="w", pady=(0, 6)) 
+        diagram_border = tk.Frame(diagram_frame, bg="#3a4150", bd=0) 
+        diagram_border.pack(fill="both", expand=True) 
+        self.diagram = TruckDiagram(diagram_border, height=220) 
+        self.diagram.pack(fill="both", expand=True, padx=2, pady=2) 
+ 
+        footer = ttk.Frame(self.root, padding=(14, 0, 14, 12)) 
+        footer.pack(fill="x") 
+        ttk.Label( 
+            footer, 
+            text=(f"Acceleration shown is net (magnitude minus gravity), in m/s². " 
+                  f"Object-detection threshold: {OBJECT_DETECT_THRESHOLD_M:.1f} m. " 
+                  f"Blind-node and other-vehicle distances are RSSI estimates — coarse, not precise."), 
+            foreground=MUTED, background=BG, font=("Segoe UI", 9), wraplength=920, 
+        ).pack(anchor="w") 
+ 
+    def _build_info_panel(self, parent, title, border_color, fields): 
+        border = tk.Frame(parent, bg=border_color, bd=0) 
+        inner = tk.Frame(border, bg=PANEL_BG) 
+        inner.pack(fill="both", expand=True, padx=2, pady=2) 
+ 
+        title_color = border_color if border_color in (ACCENT_RED, ACCENT_AMBER) else FG 
+        tk.Label(inner, text=title, bg=PANEL_BG, fg=title_color, 
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=12, pady=(10, 6)) 
+ 
+        value_labels = {} 
+        for field in fields: 
+            row = tk.Frame(inner, bg=PANEL_BG) 
+            row.pack(fill="x", padx=12, pady=4) 
+            tk.Label(row, text=field + ":", bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 10), 
+                      width=24, anchor="w").pack(side="left") 
+            val = tk.Label(row, text="--", bg=PANEL_BG, fg=FG, font=("Segoe UI", 11, "bold"), anchor="w") 
+            val.pack(side="left", fill="x", expand=True) 
+            value_labels[field] = val 
+ 
+        tk.Frame(inner, bg=PANEL_BG, height=8).pack() 
+        return border, value_labels 
+ 
+    # ---------- serial connection ---------- 
+    def _refresh_ports(self): 
+        if serial is None: 
+            self.port_combo["values"] = [] 
+            return 
+        ports = [p.device for p in serial.tools.list_ports.comports()] 
+        self.port_combo["values"] = ports 
+        if ports and not self.port_var.get(): 
+            self.port_var.set(ports[0]) 
+ 
+    def _toggle_connection(self): 
+        if self.reader is not None: 
+            self._disconnect() 
+        else: 
+            self._connect() 
+ 
+    def _connect(self): 
+        if serial is None: 
+            messagebox.showerror("Missing dependency", "pyserial is not installed.\n\nRun:\n  pip install pyserial") 
+            return 
+        port = self.port_var.get() 
+        if not port: 
+            messagebox.showwarning("No port selected", "Choose a serial port first.") 
+            return 
+        self.reader = SerialReader(port, BAUD_RATE, self.data_queue) 
+        self.reader.start() 
+        self.connect_btn.config(text="Disconnect") 
+        self.status_var.set(f"Connecting to {port} ...") 
+ 
+    def _disconnect(self): 
+        if self.reader: 
+            self.reader.stop() 
+            self.reader = None 
+        self.connect_btn.config(text="Connect") 
+        self.status_var.set("Disconnected") 
+ 
+    # ---------- queue polling ---------- 
+    def _poll_queue(self): 
+        try: 
+            while True: 
+                item = self.data_queue.get_nowait() 
+                if item[0] == "STATUS": 
+                    self.status_var.set(item[1]) 
+                    continue 
+                if item[0] == "ERROR": 
+                    self.status_var.set("Error") 
+                    messagebox.showerror("Serial error", item[1]) 
+                    self._disconnect() 
+                    continue 
+ 
+                kind, role, obj = item 
+                if kind == "VEHICLE": 
+                    if role == "LOCAL": 
+                        self.local = obj 
+                    else: 
+                        self.remote = obj 
+                elif kind == "BLIND": 
+                    self.blind = obj 
+                elif kind == "RELAY": 
+                    self.relay = obj 
+                self._refresh_panels() 
+        except queue.Empty: 
+            pass 
+        self.root.after(150, self._poll_queue) 
+ 
+    def _tick_refresh(self): 
+        self._refresh_panels() 
+        self.root.after(300, self._tick_refresh) 
+ 
+    # ---------- rendering ---------- 
+    def _refresh_panels(self): 
+        self._render_my_truck() 
+        self._render_other_vehicle() 
+        self._render_blind_node() 
+        self._render_relay_banner() 
+        self.diagram.update_diagram(self.local.roll_deg, self.local.danger_tilt, self.local.direction) 
+ 
+    def _render_my_truck(self): 
+        d = self.local 
+        stale = d.is_stale() 
+        color = MUTED if stale else FG 
+ 
+        self.my_labels["ID"].config(text=("--" if stale else d.vehicle_id), fg=color) 
+        self.my_labels["Acceleration"].config( 
+            text=("no data" if stale else f"{d.net_accel:+.2f} m/s\u00b2"), fg=color) 
+        self.my_labels["Direction"].config(text=("no data" if stale else d.direction), fg=color) 
+ 
+        if stale: 
+            obj_text, obj_color = "no data", MUTED 
+        elif d.object_detected: 
+            obj_text, obj_color = f"Object detected at {d.distance_cm / 100.0:.2f} m", ACCENT_RED 
+        else: 
+            obj_text, obj_color = "No object within threshold", ACCENT_GREEN 
+        self.my_labels["Object Detection"].config(text=obj_text, fg=obj_color) 
+ 
+    def _render_other_vehicle(self): 
+        d = self.remote 
+        stale = d.is_stale() 
+        color = MUTED if stale else FG 
+ 
+        self.other_labels["ID"].config(text=("--" if stale else d.vehicle_id), fg=color) 
+        self.other_labels["Acceleration"].config( 
+            text=("no data" if stale else f"{d.net_accel:+.2f} m/s\u00b2"), fg=color) 
+        self.other_labels["Direction to this truck"].config(text=("no data" if stale else d.direction), fg=color) 
+ 
+        if stale: 
+            dist_text, dist_color = "no data", MUTED 
+        elif d.rssi_dist_m > 0: 
+            approaching = " (approaching)" if d.closing_speed > 0.5 else "" 
+            dist_text = f"{d.rssi_dist_m:.2f} m{approaching}" 
+            dist_color = RISK_COLORS.get(d.risk, FG) 
+        else: 
+            dist_text, dist_color = "RSSI unavailable", MUTED 
+        self.other_labels["Approaching at Distance"].config(text=dist_text, fg=dist_color) 
+ 
+        risk_text = "no data" if stale else d.risk 
+        risk_color = MUTED if stale else RISK_COLORS.get(d.risk, FG) 
+        self.other_labels["Risk"].config(text=risk_text, fg=risk_color) 
+ 
+    def _render_blind_node(self): 
+        b = self.blind 
+        stale = b.is_stale() 
+        color = MUTED if stale else FG 
+        self.blind_labels["ID"].config(text=("--" if stale else b.blind_id), fg=color) 
+        self.blind_labels["Approaching at Distance"].config( 
+            text=("not detected" if stale else f"Blind node {b.blind_id} is approaching at {b.dist_m:.2f} m"), 
+            fg=(MUTED if stale else ACCENT_AMBER)) 
+ 
+    def _render_relay_banner(self): 
+        if self.relay.is_active(): 
+            self.relay_label.config( 
+                text=(f"\u26A0  Vehicle {self.relay.other_vehicle_id} is approaching from the other side " 
+                      f"of the blind node (~{self.relay.other_dist_m:.2f} m from the blind node)")) 
+            if not self.relay_label.winfo_ismapped(): 
+                self.relay_label.pack(fill="x") 
+        else: 
+            if self.relay_label.winfo_ismapped(): 
+                self.relay_label.pack_forget() 
+ 
+    def on_close(self): 
+        self._disconnect() 
+        self.root.destroy() 
+ 
+ 
+def main(): 
+    root = tk.Tk() 
+    app = DashboardApp(root) 
+    root.protocol("WM_DELETE_WINDOW", app.on_close) 
+    root.mainloop() 
+ 
+ 
+if __name__ == "__main__": 
+    main()
