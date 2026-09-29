@@ -58,6 +58,8 @@ Vehicle safety condition
 GPS/DGPS position
 
 The information is transmitted from the vehicle to the mine infrastructure using LoRa communication.
+<img width="1020" height="768" alt="image" src="https://github.com/user-attachments/assets/56465ed1-fcec-4a83-9d8b-8b26bb8d8559" />
+
 
 2. Infrastructure-Level Monitoring System
 
